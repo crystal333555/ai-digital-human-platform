@@ -1,2 +1,0 @@
-svc=C:\Users\yj821\.psacowork\workspace\20260630120021\backend\app\services\lip_sync_service.py
-log=C:\Users\yj821\.psacowork\workspace\20260630120021\backend\lip_sync_debug.log

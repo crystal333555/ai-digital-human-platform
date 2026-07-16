@@ -1,3 +1,0 @@
-DB URL: sqlite:///./app.db
-CWD: C:\Users\yj821\.psacowork\workspace\20260630120021\backend
-DB file exists: True

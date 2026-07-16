@@ -64,5 +64,25 @@ frontend/dist/
 *.bak
 .psacowork/
 
+# 安装包和压缩包
+*.exe
+*.zip
+*.7z
+*.rar
+
+# 测试文件
+test_*.py
+test_*.txt
+test_*.json
+test_*.pptx
+*_test.py
+ref_out.txt
+tts_test_output.txt
+blend_payload.json
+create_test_ppt.py
+download_*.py
+db_check.txt
+debug.txt
+
 # D盘数据
 D:/
