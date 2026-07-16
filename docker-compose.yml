@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: ai-avatar-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./backend/app:/app/app
+    environment:
+      - APP_NAME=AI Avatar Platform
+      - DEBUG=true
+      - DATABASE_URL=sqlite:///./app.db
+      - UPLOAD_DIR=/app/uploads
+      - LLM_PROVIDER=openai
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=gpt-4
+      - TTS_PROVIDER=edge-tts
+      - GPT_SOVITS_API_URL=http://gpt-sovits:9880
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ai-avatar-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+    environment:
+      - VITE_API_BASE=http://localhost:8000/api/v1
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # GPT-SoVITS 服务 (可选)
+  # gpt-sovits:
+  #   image: registry.cn-hangzhou.aliyuncs.com/funasr/funasr:runtime-cpu-latest
+  #   container_name: ai-avatar-gpt-sovits
+  #   ports:
+  #     - "9880:9880"
+  #   volumes:
+  #     - ./models/gpt-sovits:/workspace/models
+  #   restart: unless-stopped
+
+  # 向量数据库
+  # chromadb:
+  #   image: chromadb/chroma
+  #   container_name: ai-avatar-chroma
+  #   ports:
+  #     - "8001:8000"
+  #   volumes:
+  #     - chroma-data:/chroma/chroma
+  #   restart: unless-stopped
+
+volumes:
+  chroma-data:

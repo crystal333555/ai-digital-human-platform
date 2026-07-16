@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+env/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 第三方项目（独立部署）
+MuseTalk/
+GPT-SoVITS/
+
+# 模型文件（太大，不上传）
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# 用户数据
+uploads/
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.avi
+*.mov
+
+# 数据库
+*.db
+*.sqlite3
+
+# 配置文件（含敏感信息）
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 构建产物
+frontend/dist/
+
+# 临时文件
+*.tmp
+*.log
+*.bak
+.psacowork/
+
+# D盘数据
+D:/

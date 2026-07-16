@@ -1,0 +1,14 @@
+Avatars: 11
+  [1] 小玄子 | styled=None | original=../uploads/avatars\64d59a1a8f814c2480616a377979d349.jpg
+  [2] 小玄子 | styled=None | original=../uploads/avatars\df2f98cfedd945eba9d136916dc2ae94.jpg
+  [3] test | styled=None | original=../uploads/avatars\35095882cf004c659c30e7a42e7c8c88.jpg
+  [4] test | styled=None | original=../uploads/avatars\d99b4bf5b260425ab64aeee97004c6fa.jpg
+  [5] test | styled=None | original=../uploads/avatars\9e70bdfe5785492c8d714341081f3d01.jpg
+  [6] 小玄子 | styled=None | original=../uploads/avatars\27ea09ef594d46958bf3fff4ff1a1dc4.jpg
+  [7] 小玄子 | styled=None | original=../uploads/avatars\f23e172708ab46b28c47f9098016c221.jpg
+  [8] 小玄子 | styled=None | original=../uploads/avatars\df7256971c2843cc976a8b1bae64fa74.jpg
+  [9] 小玄子 | styled=None | original=../uploads/avatars\c6774390649a4d57ba99dcfde2879077.jpg
+  [10] 小玄子 | styled=None | original=../uploads/avatars\d3d0bdcaea6242f894f0b7b70d4c8918.jpg
+  [11] 小玄子 | styled=None | original=../uploads/avatars\a5288a64e73d4d8bbe5391f188529217.jpg
+Voices: 1
+  [1] 晓晓-默认 | source=edge-tts | cloned_id=None | ref_audio=
