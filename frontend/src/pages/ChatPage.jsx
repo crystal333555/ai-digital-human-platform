@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { Card, Button, Input, Select, message, Avatar as AntAvatar, List, Tag, Space, Switch } from 'antd'
 import { SendOutlined, AudioOutlined, StopOutlined, UserOutlined } from '@ant-design/icons'
-import { chatAPI, avatarAPI, voiceAPI, createWebSocket } from '../services/api.js'
+import { chatAPI, avatarAPI, voiceAPI, voiceLibAPI, createWebSocket } from '../services/api.js'
 
 const { Option } = Select
 const { TextArea } = Input
@@ -11,6 +11,7 @@ function ChatPage() {
   const [conversations, setConversations] = useState([])
   const [avatars, setAvatars] = useState([])
   const [voices, setVoices] = useState([])
+  const [presetVoices, setPresetVoices] = useState([])
   const [currentConversation, setCurrentConversation] = useState(null)
   const [messages, setMessages] = useState([])
   const [inputText, setInputText] = useState('')
@@ -44,13 +45,15 @@ function ChatPage() {
 
   const loadData = async () => {
     try {
-      const [avatarRes, voiceRes, convRes] = await Promise.all([
+      const [avatarRes, voiceRes, presetRes, convRes] = await Promise.all([
         avatarAPI.list(),
         voiceAPI.list(),
+        voiceLibAPI.presets(),
         chatAPI.listConversations()
       ])
       setAvatars(avatarRes.data || [])
       setVoices(voiceRes.data || [])
+      setPresetVoices(presetRes.data?.voices || [])
       setConversations(convRes.data || [])
     } catch (err) {
       console.error('加载数据失败', err)
@@ -180,12 +183,19 @@ function ChatPage() {
             <Select
               placeholder="选择音色"
               style={{ width: '100%' }}
-              onChange={setSelectedVoice}
+              onChange={(val) => setSelectedVoice(val)}
               value={selectedVoice}
             >
-              {voices.map(v => (
-                <Option key={v.id} value={v.id}>{v.name} ({v.source})</Option>
-              ))}
+              <Select.OptGroup label="我的音色">
+                {voices.map(v => (
+                  <Option key={`my-${v.id}`} value={v.id}>{v.name} ({v.source})</Option>
+                ))}
+              </Select.OptGroup>
+              <Select.OptGroup label="预置音色">
+                {presetVoices.map(v => (
+                  <Option key={`pre-${v.id}`} value={`preset:${v.id}`}>{v.name}（{v.category || v.gender || ''}）</Option>
+                ))}
+              </Select.OptGroup>
             </Select>
           </div>
           <div>

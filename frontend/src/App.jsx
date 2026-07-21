@@ -1,6 +1,6 @@
-import React, { useState } from 'react'
-import { BrowserRouter, Routes, Route, Link } from 'react-router-dom'
-import { Layout, Menu, Button, theme } from 'antd'
+import React, { useState, useEffect } from 'react'
+import { BrowserRouter, Routes, Route, Link, useLocation } from 'react-router-dom'
+import { Layout, Menu, Button, Tooltip } from 'antd'
 import {
   HomeOutlined,
   UserOutlined,
@@ -9,7 +9,11 @@ import {
   SettingOutlined,
   VideoCameraOutlined,
   FilePptOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons'
+import axios from 'axios'
 
 import HomePage from './pages/HomePage.jsx'
 import AvatarManager from './pages/AvatarManager.jsx'
@@ -21,11 +25,47 @@ import PPTPresenter from './pages/PPTPresenter.jsx'
 
 const { Sider, Content, Header } = Layout
 
+function ServiceStatus() {
+  const [services, setServices] = useState({ musetalk: {}, gpt_sovits: {} })
+
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const resp = await axios.get('/api/v1/system/services')
+        setServices(resp.data)
+      } catch {
+        setServices({
+          musetalk: { status: 'offline' },
+          gpt_sovits: { status: 'offline' },
+        })
+      }
+    }
+    check()
+    const timer = setInterval(check, 30000)
+    return () => clearInterval(timer)
+  }, [])
+
+  return (
+    <div className="service-status">
+      <Tooltip title={`MuseTalk: ${services.musetalk?.status || 'unknown'}`}>
+        <div className="status-item">
+          <span className={`status-dot ${services.musetalk?.status === 'online' ? 'online' : 'offline'}`} />
+          <span>MuseTalk</span>
+        </div>
+      </Tooltip>
+      <Tooltip title={`TTS: ${services.gpt_sovits?.status || 'unknown'}`}>
+        <div className="status-item">
+          <span className={`status-dot ${services.gpt_sovits?.status === 'online' ? 'online' : 'offline'}`} />
+          <span>TTS</span>
+        </div>
+      </Tooltip>
+    </div>
+  )
+}
+
 function App() {
   const [collapsed, setCollapsed] = useState(false)
-  const {
-    token: { colorBgContainer },
-  } = theme.useToken()
+  const location = useLocation()
 
   const menuItems = [
     { key: '/', icon: <HomeOutlined />, label: <Link to="/">首页</Link> },
@@ -37,51 +77,78 @@ function App() {
     { key: '/settings', icon: <SettingOutlined />, label: <Link to="/settings">设置</Link> },
   ]
 
+  const selectedKey = '/' + location.pathname.split('/')[1]
+
   return (
-    <BrowserRouter>
-      <Layout style={{ minHeight: '100vh' }}>
-        <Sider
-          trigger={null}
-          collapsible
-          collapsed={collapsed}
-          theme="dark"
-          style={{
-            overflow: 'auto',
-            height: '100vh',
-            position: 'fixed',
-            left: 0,
-            top: 0,
-            bottom: 0,
-          }}
-        >
-          <div className="logo" style={{ height: 64, color: 'white', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: collapsed ? 14 : 18, fontWeight: 'bold' }}>
-            {collapsed ? 'AI' : 'AI数字人'}
+    <Layout className="app-layout" style={{ minHeight: '100vh' }}>
+      <div className="app-bg" />
+      <div className="app-bg-blob blob-1" />
+      <div className="app-bg-blob blob-2" />
+
+      <Sider
+        trigger={null}
+        collapsible
+        collapsed={collapsed}
+        className="app-sider"
+        style={{
+          overflow: 'auto',
+          height: '100vh',
+          position: 'fixed',
+          left: 0,
+          top: 0,
+          bottom: 0,
+          zIndex: 10,
+        }}
+      >
+        <div className="app-logo">
+          <div className="app-logo-icon">
+            <ThunderboltOutlined />
           </div>
-          <Menu theme="dark" mode="inline" defaultSelectedKeys={['/']} items={menuItems} />
-        </Sider>
-        <Layout style={{ marginLeft: collapsed ? 80 : 200, transition: 'all 0.2s' }}>
-          <Header style={{ padding: 0, background: colorBgContainer, display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingLeft: 24, paddingRight: 24 }}>
-            <Button type="text" onClick={() => setCollapsed(!collapsed)}>
-              {collapsed ? '展开' : '收起'}
-            </Button>
-            <div style={{ fontWeight: 'bold', fontSize: 18 }}>AI数字人平台</div>
-            <div></div>
-          </Header>
-          <Content style={{ margin: '24px 16px', padding: 24, background: colorBgContainer, borderRadius: 8, minHeight: 280 }}>
-            <Routes>
-              <Route path="/" element={<HomePage />} />
-              <Route path="/avatars" element={<AvatarManager />} />
-              <Route path="/voices" element={<VoiceManager />} />
-              <Route path="/speech" element={<SpeechVideo />} />
-              <Route path="/ppt" element={<PPTPresenter />} />
-              <Route path="/chat" element={<ChatPage />} />
-              <Route path="/settings" element={<SettingsPage />} />
-            </Routes>
-          </Content>
-        </Layout>
+          {!collapsed && (
+            <div className="app-logo-text">
+              <span>数字人</span>平台
+            </div>
+          )}
+        </div>
+        <Menu
+          mode="inline"
+          selectedKeys={[selectedKey]}
+          items={menuItems}
+        />
+      </Sider>
+
+      <Layout style={{ marginLeft: collapsed ? 80 : 200, transition: 'all 0.2s', position: 'relative', zIndex: 1 }}>
+        <Header className="app-header">
+          <Button
+            type="text"
+            onClick={() => setCollapsed(!collapsed)}
+            style={{ fontSize: 18, color: 'var(--text-secondary)' }}
+          >
+            {collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+          </Button>
+          <ServiceStatus />
+        </Header>
+
+        <Content className="app-content">
+          <Routes>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/avatars" element={<AvatarManager />} />
+            <Route path="/voices" element={<VoiceManager />} />
+            <Route path="/speech" element={<SpeechVideo />} />
+            <Route path="/ppt" element={<PPTPresenter />} />
+            <Route path="/chat" element={<ChatPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+          </Routes>
+        </Content>
       </Layout>
-    </BrowserRouter>
+    </Layout>
   )
 }
 
-export default App
+export default function AppWrapper() {
+  return (
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  )
+}

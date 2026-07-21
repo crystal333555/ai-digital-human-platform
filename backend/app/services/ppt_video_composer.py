@@ -401,20 +401,20 @@ def compose_full_ppt_video(
         clips.append(clip)
     
     if transition == "fade" and len(clips) > 1:
-        # 交叉淡入淡出
-        from moviepy import CompositeVideoClip
-        faded_clips = []
-        for i, clip in enumerate(clips):
-            if i > 0:
-                clip = clip.with_effects([
-                    _CrossFadeIn(transition_duration)
-                ])
-            if i < len(clips) - 1:
-                clip = clip.with_effects([
-                    _CrossFadeOut(transition_duration)
-                ])
-            faded_clips.append(clip)
-        final_clip = concatenate_videoclips(faded_clips, method="compose")
+        # 简单拼接，后续可加过渡效果
+        try:
+            from moviepy.video.fx import CrossFadeIn, CrossFadeOut
+            faded_clips = []
+            for i, clip in enumerate(clips):
+                if i > 0:
+                    clip = clip.with_effects([CrossFadeIn(transition_duration)])
+                if i < len(clips) - 1:
+                    clip = clip.with_effects([CrossFadeOut(transition_duration)])
+                faded_clips.append(clip)
+            final_clip = concatenate_videoclips(faded_clips, method="compose")
+        except ImportError:
+            # moviepy 2.x 没有 CrossFadeIn/CrossFadeOut，直接拼接
+            final_clip = concatenate_videoclips(clips, method="compose")
     else:
         final_clip = concatenate_videoclips(clips, method="compose")
     

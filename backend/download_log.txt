@@ -1,0 +1,5 @@
+17:49:31 === Starting download ===
+17:53:17 === Starting download ===
+18:01:51 Attempt 1: 167MB / 167MB
+18:01:54 COMPLETE: 175997641 bytes
+18:01:54 === Download script ended ===

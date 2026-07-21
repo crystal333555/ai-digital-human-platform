@@ -16,7 +16,7 @@ from app.models.ppt import PPTProject, PPTSlide
 from app.models.avatar import Avatar, Voice
 from app.services.ppt_parser import parse_ppt
 from app.services.tts_service import TTSService
-from app.services.lip_sync_service import LipSyncService, _generate_segmented_musetalk
+from app.services.lip_sync_service import LipSyncService
 from app.services.ppt_video_composer import compose_slide_video, compose_full_ppt_video
 from app.services.gpu_coordinator import GPUCoordinator
 from app.config import settings
@@ -24,7 +24,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 # PPT生成串行锁 - 同一时间只允许一个PPT生成任务
-_ppt_generation_lock = asyncio.Lock()
+_ppt_generation_running = False  # 简单标志位替代Lock
 
 # 项目根目录
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -125,6 +125,11 @@ class PPTGenerateRequest(BaseModel):
     digital_human_size: float = 0.25
     transition: str = "fade"
     model: str = "musetalk"
+    segment_duration: float = 30.0
+    bbox_shift: int = 0
+    musetalk_timeout_per_second: int = 30
+    start_slide: int = 0
+    end_slide: int = 0  # 0表示到最后
 
 
 class PPTGenerateResponse(BaseModel):
@@ -379,6 +384,13 @@ async def generate_ppt_video(
         valid_slides = slides
         logger.info(f"[PPT] Auto-filled default narration for {len(slides)} slides")
     
+    # 按页数范围过滤（用于测试前N页）
+    if request.start_slide > 0 or request.end_slide > 0:
+        start = request.start_slide if request.start_slide > 0 else 0
+        end = request.end_slide if request.end_slide > 0 else len(valid_slides)
+        valid_slides = [s for s in valid_slides if start <= s.slide_index < end]
+        logger.info(f"[PPT] Slide range filter: start={start}, end={end}, filtered={len(valid_slides)} slides")
+    
     # 创建任务
     task_id = uuid.uuid4().hex[:12]
     _ppt_tasks[task_id] = {
@@ -391,20 +403,55 @@ async def generate_ppt_video(
         "output_video": None,
     }
     
-    # 启动后台任务
-    background_tasks.add_task(
-        _generate_ppt_video_task,
-        task_id=task_id,
-        project_id=project_id,
-        slides=valid_slides,
-        avatar=avatar,
-        voice=voice,
-        model=request.model,
-        layout_mode=request.layout_mode,
-        position=request.digital_human_position,
-        size_ratio=request.digital_human_size,
-        transition=request.transition,
-    )
+    # 启动后台任务（用线程池替代asyncio，确保任务不被取消）
+    import threading
+    _seg_dur = request.segment_duration
+    _bbox = request.bbox_shift
+    _timeout_ps = request.musetalk_timeout_per_second
+    _model = request.model
+    _layout = request.layout_mode
+    _pos = request.digital_human_position
+    _size = request.digital_human_size
+    _trans = request.transition
+    _avatar_id = avatar.id
+    _voice_id = voice.id if voice else None
+    _slide_ids = [s.id for s in valid_slides]
+    
+    def _run_async_task():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # 在线程内重新创建DB Session查询对象
+            from app.database import SessionLocal
+            thread_db = SessionLocal()
+            thread_avatar = thread_db.query(Avatar).filter(Avatar.id == _avatar_id).first()
+            thread_voice = thread_db.query(Voice).filter(Voice.id == _voice_id).first() if _voice_id else None
+            thread_slides = thread_db.query(PPTSlide).filter(PPTSlide.id.in_(_slide_ids)).order_by(PPTSlide.slide_index).all()
+            
+            loop.run_until_complete(_generate_ppt_video_task(
+                task_id=task_id,
+                project_id=project_id,
+                slides=thread_slides,
+                avatar=thread_avatar,
+                voice=thread_voice,
+                model=_model,
+                layout_mode=_layout,
+                position=_pos,
+                size_ratio=_size,
+                transition=_trans,
+                segment_duration=_seg_dur,
+                bbox_shift=_bbox,
+                musetalk_timeout_per_second=_timeout_ps,
+            ))
+        except Exception as e:
+            logger.error(f"[PPT] Background task error: {e}")
+            _ppt_tasks[task_id]["status"] = "error"
+            _ppt_tasks[task_id]["message"] = str(e)
+        finally:
+            loop.close()
+    
+    thread = threading.Thread(target=_run_async_task, daemon=True)
+    thread.start()
     
     return PPTGenerateResponse(
         task_id=task_id,
@@ -429,6 +476,125 @@ async def list_tasks():
     return [PPTTaskStatus(**t) for t in _ppt_tasks.values()]
 
 
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """取消/暂停PPT生成任务"""
+    if task_id not in _ppt_tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    task = _ppt_tasks[task_id]
+    if task["status"] in ("completed", "error", "cancelled"):
+        raise HTTPException(status_code=400, detail=f"任务已{task['status']}，无法取消")
+    task["status"] = "cancelled"
+    task["message"] = "用户已取消生成"
+    return {"status": "cancelled", "message": "任务已取消"}
+
+
+@router.delete("/projects/{project_id}")
+async def delete_project(project_id: int):
+    """删除PPT项目及其所有页面和生成的文件"""
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        project = db.query(PPTProject).filter(PPTProject.id == project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="项目不存在")
+
+        # 删除关联的slides
+        db.query(PPTSlide).filter(PPTSlide.project_id == project_id).delete()
+
+        # 删除生成的视频文件
+        import glob
+        ppt_output_dir = os.path.join(settings.GENERATED_DIR, "ppt")
+        for f in glob.glob(os.path.join(ppt_output_dir, f"ppt_{project_id}_*")):
+            try:
+                os.remove(f)
+            except:
+                pass
+
+        # 取消关联的正在运行的任务
+        for tid, t in _ppt_tasks.items():
+            if t.get("project_id") == project_id and t["status"] in ("pending", "processing"):
+                t["status"] = "cancelled"
+                t["message"] = "项目已删除"
+
+        db.delete(project)
+        db.commit()
+        return {"status": "deleted", "message": f"项目 {project_id} 已删除"}
+    finally:
+        db.close()
+
+
+@router.post("/projects/{project_id}/regenerate")
+async def regenerate_project(project_id: int, request: Request):
+    """重新生成PPT讲解视频（取消旧任务，创建新任务）"""
+    from app.database import SessionLocal
+    db = SessionLocal()
+    try:
+        project = db.query(PPTProject).filter(PPTProject.id == project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="项目不存在")
+
+        # 取消旧的运行中任务
+        for tid, t in _ppt_tasks.items():
+            if t.get("project_id") == project_id and t["status"] in ("pending", "processing"):
+                t["status"] = "cancelled"
+                t["message"] = "被重新生成取代"
+
+        # 重置项目状态
+        project.status = "draft"
+        db.query(PPTSlide).filter(PPTSlide.project_id == project_id).update({"status": "pending"})
+        db.commit()
+
+        # 重新触发generate
+        body = await request.json()
+        avatar_id = body.get("avatar_id", project.avatar_id or 1)
+        voice_config = body.get("voice_config")
+        layout_mode = body.get("layout_mode", "bottom_bar")
+        position = body.get("digital_human_position", "bottom-center")
+        size_ratio = body.get("digital_human_size", 0.25)
+        transition = body.get("transition", "fade")
+        model = body.get("model", "musetalk")
+
+        avatar = db.query(Avatar).filter(Avatar.id == avatar_id).first()
+        if not avatar:
+            raise HTTPException(status_code=404, detail="数字人形象不存在")
+
+        slides = db.query(PPTSlide).filter(
+            PPTSlide.project_id == project_id,
+            PPTSlide.narration_text.isnot(None),
+            PPTSlide.narration_text != ""
+        ).order_by(PPTSlide.slide_index).all()
+
+        if not slides:
+            raise HTTPException(status_code=400, detail="没有已编辑讲稿的页面")
+
+        task_id = f"ppt_{project_id}_{uuid.uuid4().hex[:8]}"
+        _ppt_tasks[task_id] = {
+            "task_id": task_id,
+            "project_id": project_id,
+            "status": "pending",
+            "message": f"重新生成，共 {len(slides)} 页",
+            "progress": 0,
+            "current_slide": 0,
+            "total_slides": len(slides),
+            "output_video": None,
+        }
+
+        asyncio.create_task(_generate_ppt_video_task(
+            task_id, project_id, slides, avatar, None, model,
+            layout_mode, position, size_ratio, transition
+        ))
+
+        return PPTGenerateResponse(
+            task_id=task_id,
+            project_id=project_id,
+            status="pending",
+            message=f"重新生成任务已创建，共 {len(slides)} 页",
+        )
+    finally:
+        db.close()
+
+
 # ===== 后台任务 =====
 
 async def _generate_ppt_video_task(
@@ -442,20 +608,30 @@ async def _generate_ppt_video_task(
     position: str,
     size_ratio: float,
     transition: str,
+    segment_duration: float = 30.0,
+    bbox_shift: int = 0,
+    musetalk_timeout_per_second: int = 30,
 ):
     """后台任务：逐页生成PPT讲解视频（串行执行，同时只允许一个）"""
     
-    # 串行锁：等待其他PPT生成任务完成
-    if _ppt_generation_lock.locked():
+    # 串行控制：等待其他PPT生成任务完成
+    global _ppt_generation_running
+    if _ppt_generation_running:
         task = _ppt_tasks[task_id]
         task["message"] = "等待其他PPT生成任务完成..."
         logger.info(f"[PPT-{project_id}] Waiting for other PPT generation to finish")
+        while _ppt_generation_running:
+            await asyncio.sleep(2)
     
-    async with _ppt_generation_lock:
+    _ppt_generation_running = True
+    try:
         await _generate_ppt_video_task_inner(
             task_id, project_id, slides, avatar, voice, model,
-            layout_mode, position, size_ratio, transition
+            layout_mode, position, size_ratio, transition,
+            segment_duration, bbox_shift, musetalk_timeout_per_second
         )
+    finally:
+        _ppt_generation_running = False
 
 
 async def _generate_ppt_video_task_inner(
@@ -469,6 +645,9 @@ async def _generate_ppt_video_task_inner(
     position: str,
     size_ratio: float,
     transition: str,
+    segment_duration: float = 30.0,
+    bbox_shift: int = 0,
+    musetalk_timeout_per_second: int = 30,
 ):
     """PPT视频生成实际逻辑 - 两阶段策略：
     
@@ -487,7 +666,7 @@ async def _generate_ppt_video_task_inner(
     
     try:
         # 解析形象图片路径
-        image_path = avatar.styled_image_path or avatar.original_image_path
+        image_path = avatar.transparent_image_path or avatar.styled_image_path or avatar.original_image_path
         if image_path:
             image_path = _resolve_path(image_path)
         if not image_path or not os.path.exists(image_path):
@@ -500,12 +679,19 @@ async def _generate_ppt_video_task_inner(
         output_dir = os.path.join(settings.GENERATED_DIR, "ppt")
         os.makedirs(output_dir, exist_ok=True)
         
+        # 判断MuseTalk是否在远程机器上
+        musetalk_url = getattr(settings, 'MUSETALK_API_URL', 'http://localhost:7861')
+        is_remote_musetalk = not musetalk_url.startswith(('http://localhost', 'http://127.0.0.1'))
+        if is_remote_musetalk:
+            logger.info(f"[PPT-{project_id}] Remote MuseTalk at {musetalk_url}, GPU coordination disabled")
+        
         # ========== Phase 1: 批量TTS ==========
         logger.info(f"[PPT-{project_id}] Phase 1: Batch TTS generation for {len(slides)} slides")
         task["message"] = f"Phase 1: 批量生成TTS音频 (0/{len(slides)})"
         
-        # 释放MuseTalk GPU，让GPT-SoVITS独占
-        await gpu_coord.acquire_for_tts()
+        # 远程MuseTalk不需要GPU协调；本地模式才需要释放MuseTalk GPU
+        if not is_remote_musetalk:
+            await gpu_coord.acquire_for_tts()
         
         audio_paths = {}  # slide_index -> audio_path
         tts_failed = []
@@ -568,12 +754,29 @@ async def _generate_ppt_video_task_inner(
         logger.info(f"[PPT-{project_id}] Phase 2: Batch MuseTalk lip sync for {len(audio_paths)} slides")
         task["message"] = f"Phase 2: 批量生成口型视频 (0/{len(audio_paths)})"
         
-        # MuseTalk重新加载到GPU
-        lipsync_ready = await gpu_coord.acquire_for_lipsync()
-        if not lipsync_ready:
-            task["status"] = "error"
-            task["message"] = "MuseTalk GPU加载失败，无法生成口型视频"
-            return
+        # 远程MuseTalk不需要GPU协调（机器B独占GPU）
+        if not is_remote_musetalk:
+            # 本地模式：需要GPU协调
+            lipsync_ready = await gpu_coord.acquire_for_lipsync()
+            if not lipsync_ready:
+                task["status"] = "error"
+                task["message"] = "MuseTalk GPU加载失败，无法生成口型视频"
+                return
+        else:
+            logger.info(f"[PPT-{project_id}] Remote MuseTalk at {musetalk_url}, skipping GPU coordination")
+            # 远程模式：检查MuseTalk健康状态即可
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(f"{musetalk_url}/health")
+                    if resp.status_code != 200 or not resp.json().get("models_loaded"):
+                        task["status"] = "error"
+                        task["message"] = "远程MuseTalk服务不可用"
+                        return
+            except Exception as e:
+                task["status"] = "error"
+                task["message"] = f"远程MuseTalk连接失败: {e}"
+                return
         
         video_paths = {}  # slide_index -> video_path
         lipsync_failed = []
@@ -599,10 +802,12 @@ async def _generate_ppt_video_task_inner(
                             image_path=image_path,
                             audio_path=audio_path,
                             output_path=video_path,
-                            segment_duration=20.0,
+                            segment_duration=segment_duration,
                             output_dir=output_dir,
                             project_id=project_id,
                             slide_index=slide.slide_index,
+                            bbox_shift=bbox_shift,
+                            musetalk_timeout_per_second=musetalk_timeout_per_second,
                         )
                     else:
                         await lip_sync_service.generate_lip_sync_video(
@@ -730,10 +935,12 @@ async def _generate_segmented_musetalk(
     image_path: str,
     audio_path: str,
     output_path: str,
-    segment_duration: float = 20.0,
+    segment_duration: float = 30.0,
     output_dir: str = "",
     project_id: int = 0,
     slide_index: int = 0,
+    bbox_shift: int = 0,
+    musetalk_timeout_per_second: int = 30,
 ) -> str:
     """
     将长音频分段后逐段调用MuseTalk，再拼接为完整视频。
@@ -785,7 +992,334 @@ async def _generate_segmented_musetalk(
             model="musetalk",
         )
         return output_path
-    
+
+
+# ==================== 分段管理API ====================
+
+class SlideGenerateRequest(BaseModel):
+    avatar_id: int
+    voice_id: Optional[int] = None
+    voice_config: Optional[dict] = None
+    layout_mode: str = "pip"
+    digital_human_position: str = "bottom-right"
+    digital_human_size: float = 0.25
+    segment_duration: float = 30.0
+    bbox_shift: int = 0
+    musetalk_timeout_per_second: int = 30
+
+
+class MergeRequest(BaseModel):
+    slide_ids: List[int] = []
+    transition: str = "fade"
+
+
+# 单页生成任务存储
+_slide_tasks = {}
+
+
+@router.post("/projects/{project_id}/slides/{slide_id}/generate")
+async def generate_single_slide(
+    project_id: int,
+    slide_id: int,
+    request: SlideGenerateRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """生成单页PPT视频"""
+    slide = db.query(PPTSlide).filter(
+        PPTSlide.id == slide_id,
+        PPTSlide.project_id == project_id
+    ).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="页面不存在")
+
+    project = db.query(PPTProject).filter(PPTProject.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    avatar = db.query(Avatar).filter(Avatar.id == request.avatar_id).first()
+    if not avatar:
+        raise HTTPException(status_code=404, detail="数字人形象不存在")
+
+    voice = None
+    if request.voice_id:
+        voice = db.query(Voice).filter(Voice.id == request.voice_id).first()
+
+    task_id = str(uuid.uuid4())[:12]
+    _slide_tasks[task_id] = {
+        "task_id": task_id,
+        "project_id": project_id,
+        "slide_id": slide_id,
+        "slide_index": slide.slide_index,
+        "status": "pending",
+        "message": "等待开始...",
+        "progress": 0,
+        "current_slide": 1,
+        "total_slides": 1,
+    }
+
+    # 更新slide状态
+    slide.status = "generating"
+    db.commit()
+
+    # 在线程中运行
+    import threading
+    _avatar_id = avatar.id
+    _voice_id = voice.id if voice else None
+    _layout = request.layout_mode
+    _pos = request.digital_human_position
+    _size = request.digital_human_size
+    _seg_dur = request.segment_duration
+    _bbox = request.bbox_shift
+    _timeout_ps = request.musetalk_timeout_per_second
+    _narration = slide.narration_text or ""
+    _slide_index = slide.slide_index
+    _slide_id = slide_id
+
+    def _run_slide_task():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_generate_single_slide_task(
+                task_id, project_id, _slide_id, _slide_index, _narration,
+                _avatar_id, _voice_id, _layout, _pos, _size,
+                _seg_dur, _bbox, _timeout_ps
+            ))
+        except Exception as e:
+            logger.error(f"[PPT] Slide task error: {e}")
+            _slide_tasks[task_id]["status"] = "error"
+            _slide_tasks[task_id]["message"] = str(e)
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_run_slide_task, daemon=True)
+    thread.start()
+
+    return {"task_id": task_id, "status": "pending", "message": f"正在生成第{_slide_index + 1}页"}
+
+
+async def _generate_single_slide_task(
+    task_id, project_id, slide_id, slide_index, narration,
+    avatar_id, voice_id, layout_mode, position, size_ratio,
+    segment_duration, bbox_shift, musetalk_timeout_per_second
+):
+    """单页视频生成任务"""
+    from app.database import SessionLocal
+    thread_db = SessionLocal()
+
+    try:
+        task = _slide_tasks[task_id]
+        task["status"] = "processing"
+        task["message"] = "正在生成语音..."
+
+        avatar = thread_db.query(Avatar).filter(Avatar.id == avatar_id).first()
+        voice = thread_db.query(Voice).filter(Voice.id == voice_id).first() if voice_id else None
+        slide = thread_db.query(PPTSlide).filter(PPTSlide.id == slide_id).first()
+
+        output_dir = os.path.join(settings.GENERATED_DIR, "ppt")
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1. TTS
+        tts = TTSService()
+        audio_filename = f"ppt_{project_id}_slide_{slide_index}_{uuid.uuid4().hex[:8]}.wav"
+        audio_path = os.path.join(output_dir, audio_filename)
+
+        if voice and voice.source == "cloned":
+            tts_result = await tts.generate_with_gpt_sovits(narration, voice, audio_path)
+        else:
+            edge_voice = "zh-CN-XiaoxiaoNeural"
+            if voice and voice.source == "blended":
+                edge_voice = voice.edge_tts_voice or edge_voice
+            tts_result = await tts.generate_with_edge_tts(narration, edge_voice, audio_path)
+
+        if not tts_result or not os.path.exists(audio_path):
+            task["status"] = "error"
+            task["message"] = "TTS语音生成失败"
+            slide.status = "error"
+            thread_db.commit()
+            return
+
+        task["message"] = "正在生成口型视频..."
+
+        # 2. MuseTalk
+        image_path = avatar.transparent_image_path or avatar.styled_image_path or avatar.original_image_path
+        if image_path:
+            image_path = _resolve_path(image_path)
+        if not image_path or not os.path.exists(image_path):
+            image_path = _resolve_path(avatar.original_image_path) if avatar.original_image_path else ""
+
+        video_filename = f"ppt_{project_id}_slide_{slide_index}_{uuid.uuid4().hex[:8]}.mp4"
+        video_path = os.path.join(output_dir, video_filename)
+
+        video_result = await _generate_segmented_musetalk(
+            image_path=image_path,
+            audio_path=audio_path,
+            output_path=video_path,
+            segment_duration=segment_duration,
+            output_dir=output_dir,
+            project_id=project_id,
+            slide_index=slide_index,
+            bbox_shift=bbox_shift,
+            musetalk_timeout_per_second=musetalk_timeout_per_second,
+        )
+
+        if not video_result or not os.path.exists(video_result):
+            task["status"] = "error"
+            task["message"] = "MuseTalk口型视频生成失败"
+            slide.status = "error"
+            thread_db.commit()
+            return
+
+        task["message"] = "正在合成画中画..."
+
+        # 3. 合成画中画
+        slide_image = _resolve_path(slide.slide_image_path) if slide.slide_image_path else ""
+        composed_filename = f"ppt_{project_id}_composed_{slide_index}_{uuid.uuid4().hex[:8]}.mp4"
+        composed_path = os.path.join(output_dir, composed_filename)
+
+        composed = compose_slide_video(
+            slide_image_path=slide_image,
+            avatar_video_path=video_result,
+            output_path=composed_path,
+            layout_mode=layout_mode,
+            position=position,
+            size_ratio=size_ratio,
+        )
+
+        if composed and os.path.exists(composed):
+            slide.composed_video_path = composed
+            slide.duration = _get_audio_duration(audio_path)
+            slide.status = "completed"
+            thread_db.commit()
+            task["status"] = "completed"
+            task["message"] = "生成完成"
+            task["video_url"] = f"/data/generated/ppt/{composed_filename}"
+        else:
+            task["status"] = "error"
+            task["message"] = "视频合成失败"
+            slide.status = "error"
+            thread_db.commit()
+
+    except Exception as e:
+        logger.error(f"[PPT] Single slide task error: {e}")
+        task = _slide_tasks.get(task_id)
+        if task:
+            task["status"] = "error"
+            task["message"] = str(e)
+        slide = thread_db.query(PPTSlide).filter(PPTSlide.id == slide_id).first()
+        if slide:
+            slide.status = "error"
+            thread_db.commit()
+    finally:
+        thread_db.close()
+
+
+@router.get("/projects/{project_id}/slides/{slide_id}/status")
+async def get_slide_status(project_id: int, slide_id: int):
+    """查询单页生成状态"""
+    for task in _slide_tasks.values():
+        if task.get("slide_id") == slide_id and task.get("project_id") == project_id:
+            return task
+    return {"status": "idle", "message": "无生成任务"}
+
+
+@router.post("/projects/{project_id}/merge")
+async def merge_selected_slides(
+    project_id: int,
+    request: MergeRequest,
+    db: Session = Depends(get_db)
+):
+    """合成选中页视频"""
+    project = db.query(PPTProject).filter(PPTProject.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    if request.slide_ids:
+        slides = db.query(PPTSlide).filter(
+            PPTSlide.project_id == project_id,
+            PPTSlide.id.in_(request.slide_ids),
+            PPTSlide.status == "completed"
+        ).order_by(PPTSlide.slide_index).all()
+    else:
+        slides = db.query(PPTSlide).filter(
+            PPTSlide.project_id == project_id,
+            PPTSlide.status == "completed"
+        ).order_by(PPTSlide.slide_index).all()
+
+    if not slides:
+        raise HTTPException(status_code=400, detail="没有已完成的页面可合成")
+
+    output_dir = os.path.join(settings.GENERATED_DIR, "ppt")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 收集已合成视频
+    video_paths = []
+    for slide in slides:
+        if slide.composed_video_path and os.path.exists(slide.composed_video_path):
+            video_paths.append(slide.composed_video_path)
+
+    if not video_paths:
+        raise HTTPException(status_code=400, detail="没有找到已合成的视频文件")
+
+    # 拼接
+    final_filename = f"ppt_{project_id}_final_{uuid.uuid4().hex[:8]}.mp4"
+    final_path = os.path.join(output_dir, final_filename)
+
+    try:
+        from moviepy import VideoFileClip, concatenate_videoclips
+        clips = [VideoFileClip(vp) for vp in video_paths]
+        final_clip = concatenate_videoclips(clips, method="compose")
+        final_clip.write_videofile(final_path, codec="libx264", audio_codec="aac", verbose=False, logger=None)
+        for clip in clips:
+            clip.close()
+        final_clip.close()
+
+        # 更新项目
+        project.status = "completed"
+        project.output_video_path = f"/data/generated/ppt/{final_filename}"
+        db.commit()
+
+        return {
+            "success": True,
+            "video_url": f"/data/generated/ppt/{final_filename}",
+            "slide_count": len(video_paths),
+            "message": f"已合成{len(video_paths)}页视频"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"合成失败: {str(e)}")
+
+
+@router.get("/projects/{project_id}/slides/{slide_id}/video")
+async def get_slide_video(project_id: int, slide_id: int, db: Session = Depends(get_db)):
+    """获取单页视频文件路径"""
+    slide = db.query(PPTSlide).filter(
+        PPTSlide.id == slide_id,
+        PPTSlide.project_id == project_id
+    ).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="页面不存在")
+    if not slide.composed_video_path:
+        raise HTTPException(status_code=404, detail="该页视频尚未生成")
+    return {"video_url": slide.composed_video_path.replace("\\", "/")}
+
+
+def _get_audio_duration(audio_path: str) -> float:
+    """获取音频时长"""
+    try:
+        from moviepy import AudioFileClip
+        clip = AudioFileClip(audio_path)
+        dur = clip.duration
+        clip.close()
+        return dur
+    except:
+        return 0.0
+
+
+async def _generate_segmented_musetalk_tail(
+    segment_audio_paths, image_path, output_dir, project_id, slide_index,
+    output_path, bbox_shift, musetalk_timeout_per_second, ffmpeg_exe
+):
+    """同步部分：逐段生成MuseTalk视频并拼接（在线程中调用）"""
     # 3. 逐段生成MuseTalk视频
     segment_video_paths = []
     lip_sync = LipSyncService()
@@ -799,6 +1333,8 @@ async def _generate_segmented_musetalk(
                 audio_path=seg_audio,
                 output_path=seg_video_path,
                 model="musetalk",
+                bbox_shift=bbox_shift,
+                musetalk_timeout_per_second=musetalk_timeout_per_second,
             )
             if result and os.path.exists(result):
                 segment_video_paths.append(result)

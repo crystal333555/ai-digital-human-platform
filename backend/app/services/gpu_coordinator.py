@@ -25,7 +25,7 @@ class GPUCoordinator:
     def __init__(self):
         self.musetalk_url = os.environ.get("MUSETALK_API_URL", "http://localhost:7861")
         self.gpt_sovits_url = os.environ.get("GPT_SOVITS_API_URL", "http://localhost:9880")
-        self._lock = asyncio.Lock()
+        self._lock = None  # 延迟初始化
         self._phase = "idle"  # idle | tts | lipsync
     
     @classmethod
@@ -42,6 +42,8 @@ class GPUCoordinator:
         2. 将GPT-SoVITS模型加载回GPU（如果GPT-SoVITS在运行）
         3. 标记TTS阶段开始
         """
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             logger.info("[GPU-Coord] Acquiring GPU for TTS (GPT-SoVITS)...")
             self._phase = "tts"
@@ -77,6 +79,8 @@ class GPUCoordinator:
         2. 等待GPU显存释放
         3. 标记TTS阶段结束
         """
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             logger.info("[GPU-Coord] Releasing GPU from TTS...")
             self._phase = "idle"
@@ -110,6 +114,8 @@ class GPUCoordinator:
         3. 验证MuseTalk模型加载成功
         4. 标记口型同步阶段开始
         """
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             logger.info("[GPU-Coord] Acquiring GPU for LipSync (MuseTalk)...")
             self._phase = "lipsync"
@@ -134,6 +140,8 @@ class GPUCoordinator:
     
     async def release_from_lipsync(self):
         """口型同步阶段完成（保持MuseTalk热加载，不释放GPU）"""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             self._phase = "idle"
             logger.info("[GPU-Coord] LipSync phase complete, MuseTalk stays on GPU (hot)")

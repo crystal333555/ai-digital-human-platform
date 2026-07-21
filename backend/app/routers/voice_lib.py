@@ -83,7 +83,7 @@ async def test_preset_voice(
             "success": True,
             "voice_id": voice_id,
             "voice_name": voice["name"],
-            "audio_url": f"/uploads/generated/{output_file}",
+            "audio_url": f"/data/generated/{output_file}",
             "text": text
         }
     except Exception as e:
@@ -127,7 +127,7 @@ async def blend_voices(request: BlendRequest):
         
         return {
             "success": True,
-            "audio_url": f"/uploads/generated/{output_file}",
+            "audio_url": f"/data/generated/{output_file}",
             "text": request.text,
             "blend_info": {
                 "voice_ids": request.voice_ids,
@@ -225,4 +225,68 @@ async def clone_preset_to_mine(
         "preset_based_on": voice_id,
         "name": voice.name,
         "message": f"已将 {preset['name']} 复制到你的音色库"
+    }
+
+
+class SaveBlendRequest(BaseModel):
+    name: str
+    description: str = ""
+    voice_ids: List[str]
+    weights: List[float]
+    method: str = "audio"
+
+
+@router.post("/blend/save")
+async def save_blend_voice(
+    request: SaveBlendRequest,
+    db: Session = Depends(get_db)
+):
+    """将混合音色保存到我的音色库，可在其他模块中使用"""
+    if len(request.voice_ids) < 2:
+        raise HTTPException(status_code=400, detail="至少需要2个音色")
+
+    # 验证音色存在
+    for vid in request.voice_ids:
+        if not get_preset_voice(vid):
+            raise HTTPException(status_code=400, detail=f"音色不存在: {vid}")
+
+    # 归一化权重
+    total = sum(request.weights)
+    norm_weights = [w / total for w in request.weights] if total > 0 else [1.0 / len(request.weights)] * len(request.weights)
+
+    # 获取音色名称用于描述
+    voice_names = [get_preset_voice(vid)["name"] for vid in request.voice_ids]
+    blend_desc = " + ".join([f"{name}({int(w*100)}%)" for name, w in zip(voice_names, norm_weights)])
+
+    from app.models.avatar import User
+    user = db.query(User).first()
+    if not user:
+        user = User(username="admin", email="admin@example.com")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    voice = Voice(
+        name=request.name,
+        description=request.description or f"混合音色: {blend_desc}",
+        source="blended",
+        tts_config={
+            "type": "blend",
+            "voice_ids": request.voice_ids,
+            "weights": norm_weights,
+            "method": request.method,
+            "voice_names": voice_names,
+        },
+        owner_id=user.id
+    )
+
+    db.add(voice)
+    db.commit()
+    db.refresh(voice)
+
+    return {
+        "success": True,
+        "voice_id": voice.id,
+        "name": voice.name,
+        "message": f"混合音色「{request.name}」已保存到我的音色库"
     }

@@ -78,12 +78,15 @@ lip_sync_service = LipSyncService()
 class SpeechGenerateRequest(BaseModel):
     avatar_id: int
     voice_id: Optional[int] = None
-    voice_config: Optional[dict] = None  # {"type": "preset", "id": "xxx", "edge_voice": "...", "rate": "+0%", "pitch": "+0Hz"}
+    voice_config: Optional[dict] = None
     text: str
     title: Optional[str] = "演讲视频"
-    segment_strategy: Optional[str] = "sentence"  # sentence | paragraph
+    segment_strategy: Optional[str] = "sentence"
     model: Optional[str] = "musetalk"
-    speed: Optional[float] = 1.0  # TTS语速倍率 (0.5~2.0, 默认1.0)
+    speed: Optional[float] = 1.0
+    background: Optional[str] = "transparent"  # transparent | 背景图URL
+    avatar_scale: Optional[float] = 1.0  # 数字人占画面比例 0.5-1.0
+    target_resolution: Optional[str] = "1024x1024"  # 输出视频分辨率
 
 
 class SpeechSegment(BaseModel):
@@ -140,6 +143,9 @@ async def generate_speech_video_task(
     model: str,
     output_dir: str,
     speed: float = 1.0,
+    background: str = "transparent",
+    avatar_scale: float = 1.0,
+    target_resolution: str = "1024x1024",
 ):
     """后台任务：串行生成音频+视频，避免GPU显存冲突
     
@@ -155,7 +161,7 @@ async def generate_speech_video_task(
     
     async with _speech_generation_lock:
         await _generate_speech_video_inner(
-            task_id, segments, avatar, voice, model, output_dir, speed
+            task_id, segments, avatar, voice, model, output_dir, speed, background, avatar_scale, target_resolution
         )
 
 
@@ -167,6 +173,9 @@ async def _generate_speech_video_inner(
     model: str,
     output_dir: str,
     speed: float = 1.0,
+    background: str = "transparent",
+    avatar_scale: float = 1.0,
+    target_resolution: str = "1024x1024",
 ):
     """演讲视频生成实际逻辑"""
     task = _speech_tasks[task_id]
@@ -283,7 +292,7 @@ async def _generate_speech_video_inner(
                     image_path=image_path,
                     audio_path=audio_path,
                     output_path=video_path,
-                    segment_duration=20.0,
+                    segment_duration=30.0,
                     output_dir=output_dir,
                 )
                 if result and os.path.exists(video_path) and os.path.getsize(video_path) > 1000:
@@ -325,11 +334,9 @@ async def _generate_speech_video_inner(
         final_path = os.path.join(output_dir, final_filename)
 
         if len(video_files) == 1:
-            # 只有一段，直接复制
             import shutil
             shutil.copy2(video_files[0], final_path)
         else:
-            # 使用 moviepy 拼接
             from moviepy import VideoFileClip, concatenate_videoclips
 
             clips = []
@@ -351,6 +358,96 @@ async def _generate_speech_video_inner(
             for clip in clips:
                 clip.close()
             final_clip.close()
+
+        # 背景合成：如果选择了背景图，逐帧去背景后叠加到背景上
+        if background and background != 'transparent':
+            bg_path = None
+            if background.startswith('/uploads/'):
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+                bg_path = os.path.join(project_root, background.lstrip('/'))
+            elif background.startswith('http'):
+                import httpx as _httpx
+                bg_filename = f"bg_{uuid.uuid4().hex[:8]}.jpg"
+                bg_path = os.path.join(output_dir, bg_filename)
+                try:
+                    resp = _httpx.get(background, timeout=15.0)
+                    with open(bg_path, 'wb') as f:
+                        f.write(resp.content)
+                except:
+                    bg_path = None
+            
+            if bg_path and os.path.exists(bg_path):
+                try:
+                    from moviepy import VideoFileClip, ImageClip, CompositeVideoClip
+                    from PIL import Image as PILImage
+                    import numpy as np
+                    
+                    video_clip = VideoFileClip(final_path)
+                    w, h = video_clip.w, video_clip.h
+                    duration = video_clip.duration
+                    
+                    # 读取背景图，缩放到视频尺寸
+                    bg_img = PILImage.open(bg_path).convert('RGB')
+                    bg_img = bg_img.resize((w, h), PILImage.LANCZOS)
+                    bg_arr = np.array(bg_img)
+                    
+                    # 逐帧去背景
+                    try:
+                        from rembg import remove as rembg_remove
+                        
+                        frames = []
+                        for frame in video_clip.iter_frames(fps=24, dtype='uint8'):
+                            # 去背景，得到RGBA
+                            rgba = rembg_remove(frame)
+                            # 合成到背景上
+                            rgb = rgba[:,:,:3]
+                            alpha = rgba[:,:,3:4].astype(float) / 255.0
+                            composited = (rgb * alpha + bg_arr * (1 - alpha)).astype(np.uint8)
+                            frames.append(composited)
+                        
+                        # 从帧序列创建新视频
+                        from moviepy import ImageSequenceClip
+                        composed_clip = ImageSequenceClip(frames, fps=24)
+                        if video_clip.audio:
+                            composed_clip = composed_clip.with_audio(video_clip.audio)
+                        
+                        composed_path = os.path.join(output_dir, f"speech_{task_id}_bg.mp4")
+                        composed_clip.write_videofile(
+                            composed_path,
+                            fps=24,
+                            codec="libx264",
+                            audio_codec="aac",
+                            temp_audiofile=os.path.join(output_dir, "temp-audio-bg.m4a"),
+                            remove_temp=True,
+                            logger=None
+                        )
+                        composed_clip.close()
+                        
+                        import shutil as _shutil
+                        _shutil.move(composed_path, final_path)
+                        
+                    except ImportError:
+                        # rembg不可用，用简单叠加（数字人视频直接覆盖背景）
+                        bg_temp = os.path.join(output_dir, f"bg_temp_{uuid.uuid4().hex[:6]}.png")
+                        bg_img.save(bg_temp, "PNG")
+                        bg_clip = ImageClip(bg_temp).with_duration(duration)
+                        composed = CompositeVideoClip([bg_clip, video_clip.set_position('center')])
+                        
+                        composed_path = os.path.join(output_dir, f"speech_{task_id}_bg.mp4")
+                        composed.write_videofile(
+                            composed_path, fps=24, codec="libx264", audio_codec="aac",
+                            temp_audiofile=os.path.join(output_dir, "temp-audio-bg.m4a"),
+                            remove_temp=True, logger=None
+                        )
+                        composed.close()
+                        import shutil as _shutil
+                        _shutil.move(composed_path, final_path)
+                        if os.path.exists(bg_temp):
+                            os.remove(bg_temp)
+                    
+                    video_clip.close()
+                except Exception as bg_err:
+                    pass  # 背景合成失败，使用原始视频
 
         task["output_video"] = _path_to_url(final_path)
         task["status"] = "completed"
@@ -457,7 +554,10 @@ async def generate_speech(
         avatar=avatar,
         voice=voice,
         model=request.model,
-        output_dir=output_dir
+        output_dir=output_dir,
+        background=request.background,
+        avatar_scale=request.avatar_scale,
+        target_resolution=request.target_resolution,
     )
 
     return SpeechTaskResponse(

@@ -65,7 +65,7 @@ class LipSyncService:
         self.wav2lip_path = settings.WAV2LIP_MODEL_PATH
         self.musetalk_api_url = getattr(settings, 'MUSETALK_API_URL', 'http://localhost:7861')
         # GPU锁：确保同一时间只有一个MuseTalk推理任务
-        self._gpu_lock = asyncio.Lock()
+        self._gpu_lock = None  # 延迟初始化
         # MuseTalk连续推理计数器，用于决定是否需要重启
         self._inference_count = 0
         self._max_inferences_before_restart = 5  # 每5次推理后重启一次防止内存碎片
@@ -75,22 +75,56 @@ class LipSyncService:
         image_path: str,
         audio_path: str,
         output_path: str,
-        model: Optional[str] = None
+        model: Optional[str] = None,
+        bbox_shift: int = 0,
+        musetalk_timeout_per_second: int = 30,
     ) -> str:
+        # LivePortrait高质量模式
+        if model == "liveportrait":
+            try:
+                from app.services.liveportrait_service import LivePortraitService
+                lp = LivePortraitService()
+                _log(f"Using LivePortrait for high-quality generation")
+                result = await lp.generate_video(image_path, audio_path, output_path, timeout=600)
+                if result and os.path.exists(result):
+                    self._inference_count += 1
+                    return result
+                _log(f"LivePortrait failed, falling back to musetalk")
+                model = "musetalk"  # 降级到MuseTalk
+            except Exception as e:
+                _log(f"LivePortrait error: {e}, falling back to musetalk")
+                model = "musetalk"
         """
         生成口型同步视频（带GPU锁，防止并发OOM）
         """
         model = model or self.model
         
+        if self._gpu_lock is None:
+            self._gpu_lock = asyncio.Lock()
         async with self._gpu_lock:
             if model in ("musetalk", "wav2lip", "sadtalker"):
                 max_retries = 3
                 for attempt in range(1, max_retries + 1):
                     _log(f"Trying MuseTalk (attempt {attempt}/{max_retries}): image={image_path} audio={audio_path}")
-                    result = await self._generate_with_musetalk(image_path, audio_path, output_path)
+                    result = await self._generate_with_musetalk(image_path, audio_path, output_path, bbox_shift=bbox_shift, musetalk_timeout_per_second=musetalk_timeout_per_second)
                     _log(f"MuseTalk attempt {attempt} result: {result}")
                     if result:
                         self._inference_count += 1
+                        # 微表情增强（保留音频）
+                        try:
+                            from app.services.micro_expression_enhancer import enhance_video
+                            enhanced_path = result.replace('.mp4', '_enhanced.mp4')
+                            _log(f"Micro-expression enhancing: {result}")
+                            enhanced = enhance_video(
+                                result, enhanced_path,
+                                target_resolution=(1024, 1024),  # 固定分辨率
+                                avatar_scale=1.0,  # 数字人占比
+                            )
+                            if enhanced and os.path.exists(enhanced):
+                                os.replace(enhanced, result)
+                                _log(f"Micro-expression enhanced: {result}")
+                        except Exception as e:
+                            _log(f"Micro-expression enhancement failed: {e}")
                         return result
                     if attempt < max_retries:
                         # 重试前先检查MuseTalk健康状态
@@ -131,12 +165,23 @@ class LipSyncService:
         self,
         image_path: str,
         audio_path: str,
-        output_path: str
+        output_path: str,
+        bbox_shift: int = 0,
+        musetalk_timeout_per_second: int = 30,
     ) -> Optional[str]:
-        """使用MuseTalk生成口型同步视频"""
+        """使用MuseTalk生成口型同步视频
+        
+        支持本地和远程MuseTalk服务：
+        - 本地(localhost)：直接传文件路径
+        - 远程：先通过file_server上传文件，再调用推理，最后下载结果
+        """
+        
+        # 判断是否远程调用
+        is_remote = not self.musetalk_api_url.startswith(("http://localhost", "http://127.0.0.1"))
+        file_server_url = self.musetalk_api_url.replace(":7861", ":7862") if is_remote else None
         
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 # 检查MuseTalk API是否可用
                 try:
                     health = await client.get(f"{self.musetalk_api_url}/health")
@@ -145,7 +190,6 @@ class LipSyncService:
                         return None
                     health_data = health.json()
                     if not health_data.get("models_loaded"):
-                        # 模型在CPU上，尝试重新加载到GPU
                         _log(f"MuseTalk models on CPU, reloading to GPU...")
                         try:
                             reload_resp = await client.post(f"{self.musetalk_api_url}/reload_gpu", timeout=30.0)
@@ -163,52 +207,154 @@ class LipSyncService:
                     _log(f"MuseTalk health check error: {he}")
                     return None
                 
-                # 调用MuseTalk生成
-                output_dir = os.path.dirname(output_path)
-                abs_audio = os.path.abspath(audio_path)
-                abs_image = os.path.abspath(image_path)
-                abs_outdir = os.path.abspath(output_dir) if output_dir else None
-                _log(f"Calling MuseTalk: image={abs_image} exists={os.path.exists(abs_image)}, audio={abs_audio} exists={os.path.exists(abs_audio)}")
-                
-                # 根据音频时长动态调整超时：每秒音频给20秒超时，最低120秒
-                # MuseTalk首次推理需要加载模型，耗时较长
-                audio_dur = _get_audio_duration_local(audio_path)
-                timeout_seconds = max(120, int(audio_dur * 20)) if audio_dur else 180
-                _log(f"MuseTalk timeout: {timeout_seconds}s (audio={audio_dur:.1f}s)")
-                
-                try:
-                    response = await client.post(
-                        f"{self.musetalk_api_url}/generate_by_path",
-                        json={
-                            "audio_path": abs_audio,
-                            "image_path": abs_image,
-                            "bbox_shift": 0,
-                            "extra_margin": 10,
-                            "parsing_mode": "jaw",
-                            "output_dir": abs_outdir,
-                            "enable_micro_expression": False
-                        },
-                        timeout=timeout_seconds
+                if is_remote:
+                    # ===== 远程模式：上传文件到机器B =====
+                    import uuid as _uuid
+                    session_id = _uuid.uuid4().hex[:8]
+                    
+                    # 上传图片
+                    remote_image = f"D:\\MuseTalkShare\\{session_id}_image.jpg"
+                    with open(image_path, 'rb') as f:
+                        img_data = f.read()
+                    resp = await client.post(
+                        f"{file_server_url}/upload",
+                        content=img_data,
+                        headers={"X-Filename": f"{session_id}_image.jpg"},
+                        timeout=30.0
                     )
-                except httpx.TimeoutException:
-                    _log(f"MuseTalk request timed out after {timeout_seconds}s")
-                    return None
-                
-                _log(f"MuseTalk response: status={response.status_code} body={response.text[:500]}")
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    generated_path = data.get("output_path")
-                    if generated_path and os.path.exists(generated_path):
-                        if os.path.abspath(generated_path) != os.path.abspath(output_path):
-                            import shutil
-                            shutil.copy2(generated_path, output_path)
-                        logger.info(f"[LipSync] MuseTalk success: {output_path}")
-                        return output_path
+                    if resp.status_code != 200:
+                        _log(f"Remote upload image failed: {resp.status_code}")
+                        return None
+                    _log(f"Uploaded image to {remote_image} ({len(img_data)} bytes)")
+                    
+                    # 上传音频
+                    remote_audio = f"D:\\MuseTalkShare\\{session_id}_audio.wav"
+                    with open(audio_path, 'rb') as f:
+                        audio_data = f.read()
+                    resp = await client.post(
+                        f"{file_server_url}/upload",
+                        content=audio_data,
+                        headers={"X-Filename": f"{session_id}_audio.wav"},
+                        timeout=30.0
+                    )
+                    if resp.status_code != 200:
+                        _log(f"Remote upload audio failed: {resp.status_code}")
+                        return None
+                    _log(f"Uploaded audio to {remote_audio} ({len(audio_data)} bytes)")
+                    
+                    # 远程输出目录
+                    remote_output_dir = "D:\\MuseTalkShare"
+                    remote_output_file = f"D:\\MuseTalkShare\\{session_id}_output.mp4"
+                    
+                    _log(f"Calling remote MuseTalk: image={remote_image}, audio={remote_audio}")
+                    
+                    # 根据音频时长动态调整超时
+                    audio_dur = _get_audio_duration_local(audio_path)
+                    timeout_seconds = max(300, int(audio_dur * musetalk_timeout_per_second)) if audio_dur else 300
+                    _log(f"MuseTalk timeout: {timeout_seconds}s (audio={audio_dur:.1f}s)")
+                    
+                    try:
+                        response = await client.post(
+                            f"{self.musetalk_api_url}/generate_by_path",
+                            json={
+                                "audio_path": remote_audio,
+                                "image_path": remote_image,
+                                "bbox_shift": bbox_shift,
+                                "extra_margin": 10,
+                                "parsing_mode": "jaw",
+                                "output_dir": remote_output_dir,
+                                "enable_micro_expression": False
+                            },
+                            timeout=timeout_seconds
+                        )
+                    except httpx.TimeoutException:
+                        _log(f"MuseTalk request timed out after {timeout_seconds}s")
+                        return None
+                    
+                    _log(f"MuseTalk response: status={response.status_code} body={response.text[:500]}")
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        generated_path = data.get("output_path", remote_output_file)
+                        _log(f"MuseTalk output_path: {generated_path}")
+                        
+                        # 下载结果文件
+                        filename = os.path.basename(generated_path)
+                        try:
+                            dl_resp = await client.post(
+                                f"{file_server_url}/download",
+                                json={"path": generated_path},
+                                timeout=60.0
+                            )
+                            if dl_resp.status_code == 200 and len(dl_resp.content) > 1000:
+                                with open(output_path, 'wb') as f:
+                                    f.write(dl_resp.content)
+                                _log(f"Downloaded result: {len(dl_resp.content)} bytes -> {output_path}")
+                                
+                                # 清理远程临时文件
+                                for fname in [f"{session_id}_image.jpg", f"{session_id}_audio.wav", filename]:
+                                    try:
+                                        await client.delete(f"{file_server_url}/{fname}", timeout=5.0)
+                                    except:
+                                        pass
+                                
+                                logger.info(f"[LipSync] Remote MuseTalk success: {output_path}")
+                                return output_path
+                            else:
+                                _log(f"Download failed: status={dl_resp.status_code}, size={len(dl_resp.content) if dl_resp.status_code == 200 else 0}")
+                        except Exception as dl_err:
+                            _log(f"Download error: {dl_err}")
+                        
+                        return None
                     else:
-                        logger.warning(f"[LipSync] MuseTalk output file not found: {generated_path}")
+                        _log(f"MuseTalk generate failed: {response.status_code} {response.text[:300]}")
+                        return None
                 
-                return None
+                else:
+                    # ===== 本地模式：直接传文件路径 =====
+                    output_dir = os.path.dirname(output_path)
+                    abs_audio = os.path.abspath(audio_path)
+                    abs_image = os.path.abspath(image_path)
+                    abs_outdir = os.path.abspath(output_dir) if output_dir else None
+                    _log(f"Calling MuseTalk: image={abs_image} exists={os.path.exists(abs_image)}, audio={abs_audio} exists={os.path.exists(abs_audio)}")
+                    
+                    audio_dur = _get_audio_duration_local(audio_path)
+                    timeout_seconds = max(300, int(audio_dur * musetalk_timeout_per_second)) if audio_dur else 300
+                    _log(f"MuseTalk timeout: {timeout_seconds}s (audio={audio_dur:.1f}s)")
+                    
+                    try:
+                        response = await client.post(
+                            f"{self.musetalk_api_url}/generate_by_path",
+                            json={
+                                "audio_path": abs_audio,
+                                "image_path": abs_image,
+                                "bbox_shift": bbox_shift,
+                                "extra_margin": 10,
+                                "parsing_mode": "jaw",
+                                "output_dir": abs_outdir,
+                                "enable_micro_expression": False
+                            },
+                            timeout=timeout_seconds
+                        )
+                    except httpx.TimeoutException:
+                        _log(f"MuseTalk request timed out after {timeout_seconds}s")
+                        return None
+                    
+                    _log(f"MuseTalk response: status={response.status_code} body={response.text[:500]}")
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        generated_path = data.get("output_path")
+                        if generated_path and os.path.exists(generated_path):
+                            if os.path.abspath(generated_path) != os.path.abspath(output_path):
+                                import shutil
+                                shutil.copy2(generated_path, output_path)
+                            logger.info(f"[LipSync] MuseTalk success: {output_path}")
+                            return output_path
+                        else:
+                            logger.warning(f"[LipSync] MuseTalk output file not found: {generated_path}")
+                    
+                    return None
                 
         except Exception as e:
             logger.error(f"[LipSync] MuseTalk failed: {e}")
@@ -328,7 +474,7 @@ async def _generate_segmented_musetalk(
     image_path: str,
     audio_path: str,
     output_path: str,
-    segment_duration: float = 20.0,
+    segment_duration: float = 60.0,
     output_dir: str = None,
     project_id: int = None,
     slide_index: int = None,

@@ -15,12 +15,14 @@ export { api }
 // 头像管理API
 export const avatarAPI = {
   upload: (formData) => api.post('/avatars/upload', formData, {
-    headers: { 'Content-Type': undefined },  // 让 axios 自动设置 multipart boundary
+    headers: { 'Content-Type': undefined },
   }),
   list: () => api.get('/avatars/'),
   get: (id) => api.get(`/avatars/${id}`),
   update: (id, data) => api.put(`/avatars/${id}`, data),
   delete: (id) => api.delete(`/avatars/${id}`),
+  removeBg: (id) => api.post(`/avatars/${id}/remove-bg`),
+  backgrounds: () => api.get('/avatars/backgrounds/list'),
 }
 
 // 音色管理API
@@ -40,10 +42,11 @@ export const voiceLibAPI = {
   categories: () => api.get('/voice-lib/categories'),
   presets: (params) => api.get('/voice-lib/presets', { params }),
   presetDetail: (id) => api.get(`/voice-lib/presets/${id}`),
-  testPreset: (id, text) => api.post(`/voice-lib/presets/${id}/test`, { text }, { params: { text } }),
+  testPreset: (id, text) => api.post(`/voice-lib/presets/${id}/test`, null, { params: { text } }),
   cloneToMine: (id, name) => api.post(`/voice-lib/presets/${id}/clone-to-mine`, { custom_name: name }),
   blend: (data) => api.post('/voice-lib/blend', data),
   blendPreview: (data) => api.post('/voice-lib/blend/preview', data),
+  saveBlend: (data) => api.post('/voice-lib/blend/save', data),
   suggestRatios: (data) => api.post('/voice-lib/blend/suggest', data),
 }
 
@@ -66,4 +69,20 @@ export const ttsAPI = {
 export function createWebSocket(conversationId) {
   const wsUrl = `ws://localhost:8000/api/v1/chat/ws/${conversationId}`
   return new WebSocket(wsUrl)
+}
+
+// PPT API
+export const pptAPI = {
+  upload: (formData) => api.post('/ppt/upload', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
+  listProjects: () => api.get('/ppt/projects'),
+  getProject: (id) => api.get(`/ppt/projects/${id}`),
+  updateProject: (id, data) => api.put(`/ppt/projects/${id}`, data),
+  deleteProject: (id) => api.delete(`/ppt/projects/${id}`),
+  updateSlide: (projectId, slideId, data) => api.put(`/ppt/projects/${projectId}/slides/${slideId}`, data),
+  generateAll: (projectId, data) => api.post(`/ppt/projects/${projectId}/generate`, data),
+  generateSlide: (projectId, slideId, data) => api.post(`/ppt/projects/${projectId}/slides/${slideId}/generate`, data),
+  getSlideStatus: (projectId, slideId) => api.get(`/ppt/projects/${projectId}/slides/${slideId}/status`),
+  mergeSlides: (projectId, slideIds) => api.post(`/ppt/projects/${projectId}/merge`, { slide_ids: slideIds }),
+  getTask: (taskId) => api.get(`/ppt/tasks/${taskId}`),
+  cancelTask: (taskId) => api.post(`/ppt/tasks/${taskId}/cancel`),
 }

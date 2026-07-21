@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { Table, Button, Modal, Form, Input, Upload, message, Tag, Card, Row, Col, Slider, Tabs, Badge, Space, Typography } from 'antd'
-import { PlusOutlined, UploadOutlined, AudioOutlined, DeleteOutlined, PlayCircleOutlined, PauseCircleOutlined, ExperimentOutlined, SoundOutlined } from '@ant-design/icons'
+import { PlusOutlined, UploadOutlined, AudioOutlined, DeleteOutlined, PlayCircleOutlined, PauseCircleOutlined, ExperimentOutlined, SoundOutlined, SaveOutlined, ReloadOutlined, CheckCircleOutlined } from '@ant-design/icons'
 import { voiceAPI, voiceLibAPI } from '../services/api.js'
 
 const { TabPane } = Tabs
@@ -23,6 +23,10 @@ function VoiceManager() {
   const [blendText, setBlendText] = useState('你好，我是融合多种特色的全新音色。')
   const [blendResult, setBlendResult] = useState(null)
   const [blendLoading, setBlendLoading] = useState(false)
+  const [blendSaveOpen, setBlendSaveOpen] = useState(false)
+  const [blendSaveName, setBlendSaveName] = useState('')
+  const [blendSaveDesc, setBlendSaveDesc] = useState('')
+  const [blendSaving, setBlendSaving] = useState(false)
   const audioRef = useRef(null)
   const [form] = Form.useForm()
 
@@ -126,7 +130,10 @@ function VoiceManager() {
     try {
       const res = await voiceAPI.preview(voice.id)
       if (res.data?.audio_url) {
-        const audioUrl = res.data.audio_url
+        let audioUrl = res.data.audio_url
+        if (audioUrl.startsWith('/data/') || audioUrl.startsWith('/uploads/')) {
+          audioUrl = `http://localhost:8000${audioUrl}`
+        }
         console.log('[VoiceManager] Preview audio URL:', audioUrl)
         const audio = new Audio(audioUrl)
         audio.onended = () => {
@@ -180,7 +187,13 @@ function VoiceManager() {
     try {
       const res = await voiceLibAPI.testPreset(voiceId)
       if (res.data?.audio_url) {
-        const audio = new Audio(res.data.audio_url)
+        let audioUrl = res.data.audio_url
+        if (audioUrl.startsWith('/data/')) {
+          audioUrl = `http://localhost:8000${audioUrl}`
+        } else if (audioUrl.startsWith('/uploads/')) {
+          audioUrl = `http://localhost:8000${audioUrl}`
+        }
+        const audio = new Audio(audioUrl)
         audio.onended = () => setPlaying(null)
         audio.onerror = () => {
           setPlaying(null)
@@ -248,23 +261,42 @@ function VoiceManager() {
       message.warning('请至少选择2个音色')
       return
     }
-    
+    if (!blendSaveName.trim()) {
+      message.warning('请输入新音色名称')
+      return
+    }
+
     setBlendLoading(true)
     setBlendResult(null)
-    
+
     try {
       const voice_ids = blendVoices.map(v => v.id)
       const weights = blendVoices.map(v => blendWeights[v.id] || 0.5)
-      
+
+      // 1. 生成混合音频预览
       const res = await voiceLibAPI.blend({
         voice_ids,
         weights,
         text: blendText,
         method: "audio"
       })
-      
       setBlendResult(res.data)
-      message.success('音色混合成功！')
+
+      // 2. 直接保存到我的音色
+      const saveRes = await voiceLibAPI.saveBlend({
+        name: blendSaveName,
+        description: blendSaveDesc,
+        voice_ids,
+        weights,
+        method: 'audio'
+      })
+
+      if (saveRes.data?.success) {
+        message.success(`混合音色「${blendSaveName}」已生成并保存到我的音色`)
+        loadVoices()
+      } else {
+        message.success('混合音色生成成功，但保存失败')
+      }
     } catch (err) {
       message.error('混合失败: ' + (err.response?.data?.detail || err.message))
     } finally {
@@ -274,8 +306,43 @@ function VoiceManager() {
 
   const playBlendResult = () => {
     if (!blendResult?.audio_url) return
-    const audio = new Audio(blendResult.audio_url)
+    let audioUrl = blendResult.audio_url
+    if (audioUrl.startsWith('/data/') || audioUrl.startsWith('/uploads/')) {
+      audioUrl = `http://localhost:8000${audioUrl}`
+    }
+    const audio = new Audio(audioUrl)
     audio.play()
+  }
+
+  const handleSaveBlend = async () => {
+    if (!blendSaveName.trim()) {
+      message.warning('请输入音色名称')
+      return
+    }
+    setBlendSaving(true)
+    try {
+      const voice_ids = blendVoices.map(v => v.id)
+      const weights = blendVoices.map(v => blendWeights[v.id] || 0.5)
+      const res = await voiceLibAPI.saveBlend({
+        name: blendSaveName,
+        description: blendSaveDesc,
+        voice_ids,
+        weights,
+        method: 'audio'
+      })
+      if (res.data?.success) {
+        message.success(res.data.message || '保存成功')
+        setBlendSaveOpen(false)
+        setBlendSaveName('')
+        setBlendSaveDesc('')
+        loadVoices()
+        setActiveTab('my')
+      }
+    } catch (err) {
+      message.error('保存失败: ' + (err.response?.data?.detail || err.message))
+    } finally {
+      setBlendSaving(false)
+    }
   }
 
   const handleAddPresetToMine = async (voice) => {
@@ -451,98 +518,199 @@ function VoiceManager() {
 
         <TabPane tab={<><ExperimentOutlined /> 音色混合 {blendVoices.length > 0 && <Badge count={blendVoices.length} />}</>} key="blend">
           <Row gutter={16}>
-            <Col span={12}>
-              <Card title="混合配置" size="small">
+            <Col span={14}>
+              <Card title="混合配置" size="small" extra={blendVoices.length >= 2 && <Tag color="green">可混合</Tag>}>
                 {blendVoices.length === 0 ? (
-                  <>
-                    <Text type="secondary">请先在「预置音色库」中选择 2~3 个音色加入混合</Text>
+                  <div style={{ textAlign: 'center', padding: '40px 0' }}>
+                    <ExperimentOutlined style={{ fontSize: 48, color: '#d9d9d9' }} />
                     <div style={{ marginTop: 16 }}>
-                      <Button type="primary" onClick={() => setActiveTab('library')}>去音色库选择 &rarr;</Button>
+                      <Text type="secondary">选择 2~3 个音色进行混合</Text>
                     </div>
-                  </>
+                    <div style={{ marginTop: 12 }}>
+                      <Button type="primary" onClick={() => setActiveTab('library')}>去音色库选择 →</Button>
+                    </div>
+                  </div>
                 ) : (
                   <>
-                    {blendVoices.length >= 1 && blendVoices.length < 3 && (
-                      <div style={{ marginBottom: 16 }}>
-                        <Text type="warning">已选 {blendVoices.length} 个音色，还需至少 {2 - blendVoices.length} 个才能混合</Text>
-                        <div style={{ marginTop: 8 }}>
-                          <Button type="primary" size="small" onClick={() => setActiveTab('library')}>
-                            添加更多音色
-                          </Button>
-                        </div>
-                      </div>
-                    )}
                     {blendVoices.map((voice, index) => (
-                      <div key={voice.id} style={{ marginBottom: 16 }}>
-                        <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                      <div key={voice.id} style={{
+                        marginBottom: 12,
+                        padding: '12px 16px',
+                        background: '#fafafa',
+                        borderRadius: 8,
+                        border: '1px solid #f0f0f0'
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                           <Space>
-                            <Text strong>{index + 1}. {voice.name}</Text>
+                            <div style={{
+                              width: 28, height: 28, borderRadius: '50%',
+                              background: `linear-gradient(135deg, ${['#5b5bd6', '#06b6d4', '#ec4899'][index]}, ${['#8186f0', '#22d3ee', '#f472b6'][index]})`,
+                              color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              fontSize: 13, fontWeight: 600
+                            }}>{index + 1}</div>
+                            <Text strong>{voice.name}</Text>
                             <Tag size="small" color={getCategoryColor(voice.category)}>{voice.category}</Tag>
                           </Space>
-                          <Button size="small" danger onClick={() => removeFromBlend(voice.id)}>移除</Button>
-                        </Space>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 8 }}>
-                          <Text type="secondary">权重</Text>
+                          <Space>
+                            <Button size="small" type="text" icon={<PlayCircleOutlined />}
+                              onClick={() => handlePreviewPreset(voice.id)}>
+                              试听
+                            </Button>
+                            <Button size="small" type="text" danger icon={<DeleteOutlined />}
+                              onClick={() => removeFromBlend(voice.id)} />
+                          </Space>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                           <Slider
-                            min={0.1}
-                            max={0.9}
-                            step={0.05}
+                            min={0.1} max={0.9} step={0.05}
                             value={blendWeights[voice.id] || 0.5}
                             onChange={(v) => updateWeight(voice.id, v)}
                             style={{ flex: 1 }}
+                            tooltip={{ formatter: v => `${Math.round(v * 100)}%` }}
                           />
-                          <Text style={{ width: 50 }}>{Math.round((blendWeights[voice.id] || 0.5) * 100)}%</Text>
+                          <div style={{
+                            width: 56, textAlign: 'center',
+                            fontWeight: 600, color: '#5b5bd6',
+                            fontSize: 14
+                          }}>
+                            {Math.round((blendWeights[voice.id] || 0.5) * 100)}%
+                          </div>
                         </div>
                       </div>
                     ))}
 
-                    <div style={{ marginTop: 16 }}>
-                      <Text>合成文本</Text>
+                    {blendVoices.length < 2 && (
+                      <div style={{ marginBottom: 12, padding: 12, background: '#fffbe6', borderRadius: 8, border: '1px solid #ffe58f' }}>
+                        <Text type="warning">还需至少选择 {2 - blendVoices.length} 个音色</Text>
+                        <Button size="small" type="link" onClick={() => setActiveTab('library')}>去添加</Button>
+                      </div>
+                    )}
+
+                    <div style={{ marginTop: 12 }}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>合成文本</Text>
                       <Input.TextArea
                         value={blendText}
                         onChange={(e) => setBlendText(e.target.value)}
                         rows={2}
-                        style={{ marginTop: 8 }}
+                        style={{ marginTop: 4 }}
+                        placeholder="输入要合成的文本内容..."
                       />
                     </div>
 
                     {blendVoices.length >= 2 && (
-                      <Button
-                        type="primary"
-                        block
-                        icon={<ExperimentOutlined />}
-                        loading={blendLoading}
-                        onClick={doBlend}
-                        style={{ marginTop: 16 }}
-                      >
-                        生成混合音色
-                      </Button>
+                      <>
+                        <div style={{ marginTop: 12, marginBottom: 12 }}>
+                          <Text strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>新音色名称</Text>
+                          <Input
+                            placeholder="如：温柔知性女声"
+                            value={blendSaveName}
+                            onChange={e => setBlendSaveName(e.target.value)}
+                            style={{ borderRadius: 8 }}
+                          />
+                        </div>
+                        <div style={{ marginBottom: 12 }}>
+                          <Text strong style={{ fontSize: 13, display: 'block', marginBottom: 6 }}>描述（可选）</Text>
+                          <Input.TextArea
+                            placeholder="如：温柔桃子60% + 邻家女孩40%"
+                            value={blendSaveDesc}
+                            onChange={e => setBlendSaveDesc(e.target.value)}
+                            rows={2}
+                            style={{ borderRadius: 8 }}
+                          />
+                        </div>
+                        <Button
+                          type="primary" block
+                          icon={<ExperimentOutlined />}
+                          loading={blendLoading}
+                          onClick={doBlend}
+                          style={{ height: 40, borderRadius: 8 }}
+                        >
+                          生成混合音色
+                        </Button>
+                      </>
                     )}
                   </>
                 )}
               </Card>
             </Col>
 
-            <Col span={12}>
+            <Col span={10}>
               <Card title="混合结果" size="small">
                 {blendResult ? (
                   <>
-                    <div style={{ marginBottom: 12 }}>
-                      <Tag color="success">合成成功</Tag>
+                    <div style={{ marginBottom: 12, padding: 12, background: '#f6ffed', borderRadius: 8, border: '1px solid #b7eb8f' }}>
+                      <Space>
+                        <CheckCircleOutlined style={{ color: '#52c41a' }} />
+                        <Text strong style={{ color: '#389e0d' }}>合成成功</Text>
+                      </Space>
                     </div>
+
                     <div style={{ marginBottom: 12 }}>
-                      {blendResult.blend_info?.voice_ids?.map((vid, idx) => {
-                        const name = presetVoices.find(v => v.id === vid)?.name || vid
-                        const weight = Math.round(blendResult.blend_info?.weights?.[idx] * 100)
-                        return <div key={vid} style={{ marginBottom: 4 }}><Tag>{name} {weight}%</Tag></div>
-                      })}
+                      <Text type="secondary" style={{ fontSize: 12 }}>混合比例</Text>
+                      <div style={{ marginTop: 8, display: 'flex', gap: 4, height: 24, borderRadius: 6, overflow: 'hidden' }}>
+                        {blendResult.blend_info?.voice_ids?.map((vid, idx) => {
+                          const name = presetVoices.find(v => v.id === vid)?.name || vid
+                          const weight = blendResult.blend_info?.normalized_weights?.[idx] || 0
+                          const colors = ['#5b5bd6', '#06b6d4', '#ec4899']
+                          return (
+                            <div key={vid} style={{
+                              flex: weight,
+                              background: colors[idx % 3],
+                              color: '#fff',
+                              fontSize: 11,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              minWidth: 30
+                            }}>
+                              {Math.round(weight * 100)}%
+                            </div>
+                          )
+                        })}
+                      </div>
+                      <div style={{ marginTop: 6, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                        {blendResult.blend_info?.voice_ids?.map((vid, idx) => {
+                          const name = presetVoices.find(v => v.id === vid)?.name || vid
+                          const colors = ['#5b5bd6', '#06b6d4', '#ec4899']
+                          return <Tag key={vid} color={colors[idx % 3]}>{name}</Tag>
+                        })}
+                      </div>
                     </div>
-                    <Button type="primary" icon={<PlayCircleOutlined />} onClick={playBlendResult}>
-                      播放混合结果
+
+                    {blendResult.audio_url && (
+                    <audio
+                      controls
+                      style={{ width: '100%', marginTop: 8 }}
+                      src={(() => {
+                        let url = blendResult.audio_url || ''
+                        if (url && (url.startsWith('/data/') || url.startsWith('/uploads/'))) {
+                          return `http://localhost:8000${url}`
+                        }
+                        return url
+                      })()}
+                    />
+                    )}
+
+                    <Button
+                      type="primary"
+                      icon={<SaveOutlined />}
+                      block
+                      style={{ marginTop: 12, borderRadius: 8 }}
+                      onClick={() => setBlendSaveOpen(true)}
+                    >
+                      保存为我的音色
                     </Button>
+                    <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4, textAlign: 'center' }}>
+                      保存后可在演讲视频、PPT讲解、对话等模块使用
+                    </Text>
                   </>
                 ) : (
-                  <Text type="secondary">混合结果将显示在这里</Text>
+                  <div style={{ textAlign: 'center', padding: '40px 0' }}>
+                    <PlayCircleOutlined style={{ fontSize: 48, color: '#d9d9d9' }} />
+                    <div style={{ marginTop: 16 }}>
+                      <Text type="secondary">混合结果将显示在这里</Text>
+                    </div>
+                  </div>
                 )}
               </Card>
             </Col>
@@ -566,6 +734,45 @@ function VoiceManager() {
           <Form.Item>
             <Button type="primary" htmlType="submit" loading={uploading} block>上传</Button>
           </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* 保存混合音色弹窗 */}
+      <Modal
+        title="保存混合音色"
+        open={blendSaveOpen}
+        onCancel={() => setBlendSaveOpen(false)}
+        onOk={handleSaveBlend}
+        confirmLoading={blendSaving}
+        okText="保存"
+        cancelText="取消"
+      >
+        <Form layout="vertical">
+          <Form.Item label="音色名称" required>
+            <Input
+              placeholder="如：温柔知性女声"
+              value={blendSaveName}
+              onChange={e => setBlendSaveName(e.target.value)}
+            />
+          </Form.Item>
+          <Form.Item label="描述（可选）">
+            <Input.TextArea
+              placeholder="如：温柔桃子60% + 邻家女孩40%，适合温柔场景"
+              value={blendSaveDesc}
+              onChange={e => setBlendSaveDesc(e.target.value)}
+              rows={2}
+            />
+          </Form.Item>
+          <div style={{ padding: '8px 12px', background: '#f5f5fa', borderRadius: 8 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>混合配置：</Text>
+            <div style={{ marginTop: 4 }}>
+              {blendVoices.map((v, i) => (
+                <Tag key={v.id} color="purple">
+                  {v.name} ({Math.round((blendWeights[v.id] || 0.5) * 100)}%)
+                </Tag>
+              ))}
+            </div>
+          </div>
         </Form>
       </Modal>
     </div>

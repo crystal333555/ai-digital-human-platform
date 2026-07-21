@@ -237,3 +237,143 @@ async def warmup_services():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "ai-avatar-platform"}
+
+
+# ============ 服务管理API ============
+
+import socket as _socket
+
+def _is_port_listening(port):
+    try:
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    except:
+        return False
+
+SERVICE_CONFIGS = {
+    "frontend": {"name": "前端", "port": 5173, "url": "http://localhost:5173/"},
+    "musetalk": {"name": "MuseTalk", "port": 7861, "url": "http://localhost:7861/health"},
+    "gpt_sovits": {"name": "GPT-SoVITS", "port": 9880, "url": "http://localhost:9880/"},
+}
+
+
+@app.get("/api/v1/system/services/all")
+async def get_all_services_status():
+    """获取所有服务状态（包括前端、MuseTalk、GPT-SoVITS）"""
+    result = {}
+    # 后端自身
+    result["backend"] = {"name": "后端API", "port": 8000, "status": "online", "port_listening": True}
+    # 其他服务
+    for key, cfg in SERVICE_CONFIGS.items():
+        port_ok = _is_port_listening(cfg["port"])
+        health_ok = False
+        if port_ok:
+            try:
+                resp = httpx.get(cfg["url"], timeout=3.0)
+                health_ok = resp.status_code == 200
+            except:
+                pass
+        status = "online" if health_ok else ("degraded" if port_ok else "offline")
+        result[key] = {
+            "name": cfg["name"],
+            "port": cfg["port"],
+            "status": status,
+            "port_listening": port_ok,
+            "health_ok": health_ok,
+        }
+    return result
+
+
+@app.post("/api/v1/system/services/{service_key}/start")
+async def start_service_api(service_key: str):
+    """启动指定服务"""
+    if service_key == "backend":
+        return {"success": False, "message": "后端API已在运行中"}
+    
+    if service_key not in SERVICE_CONFIGS:
+        raise HTTPException(status_code=400, detail=f"未知服务: {service_key}")
+    
+    cfg = SERVICE_CONFIGS[service_key]
+    if _is_port_listening(cfg["port"]):
+        return {"success": False, "message": f"{cfg['name']}已在运行（端口{cfg['port']}）"}
+    
+    try:
+        import subprocess as _sp
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        
+        if service_key == "frontend":
+            frontend_dir = os.path.join(project_root, "frontend")
+            _sp.Popen(
+                ["cmd", "/c", "cd", "/d", frontend_dir, "&&", "npx", "vite", "--host", "0.0.0.0", "--port", "5173"],
+                creationflags=_sp.CREATE_NEW_CONSOLE
+            )
+        elif service_key == "musetalk":
+            musetalk_dir = os.path.join(project_root, "MuseTalk")
+            conda_python = r"C:\Users\yj821\miniconda3\envs\musetalk\python.exe"
+            _sp.Popen(
+                ["cmd", "/c", "cd", "/d", musetalk_dir, "&&", conda_python, "musetalk_api_server.py", "--host", "0.0.0.0", "--port", "7861"],
+                creationflags=_sp.CREATE_NEW_CONSOLE
+            )
+        elif service_key == "gpt_sovits":
+            gpt_dir = os.path.join(project_root, "GPT-SoVITS")
+            conda_exe = r"C:\Users\yj821\miniconda3\Scripts\conda.exe"
+            _sp.Popen(
+                ["cmd", "/c", "cd", "/d", gpt_dir, "&&", conda_exe, "run", "-n", "gpt-sovits", "python", "api_server.py"],
+                creationflags=_sp.CREATE_NEW_CONSOLE
+            )
+        
+        import asyncio
+        await asyncio.sleep(3)
+        
+        if _is_port_listening(cfg["port"]):
+            return {"success": True, "message": f"{cfg['name']}启动成功"}
+        else:
+            return {"success": True, "message": f"{cfg['name']}启动中，请稍等..."}
+    except Exception as e:
+        return {"success": False, "message": f"启动失败: {str(e)}"}
+
+
+@app.post("/api/v1/system/services/{service_key}/stop")
+async def stop_service_api(service_key: str):
+    """停止指定服务"""
+    if service_key == "backend":
+        return {"success": False, "message": "不能通过API停止后端本身"}
+    
+    if service_key not in SERVICE_CONFIGS:
+        raise HTTPException(status_code=400, detail=f"未知服务: {service_key}")
+    
+    cfg = SERVICE_CONFIGS[service_key]
+    if not _is_port_listening(cfg["port"]):
+        return {"success": False, "message": f"{cfg['name']}未在运行"}
+    
+    try:
+        import subprocess as _sp
+        result = _sp.run(["netstat", "-ano"], capture_output=True, text=True, timeout=5)
+        killed = False
+        for line in result.stdout.split("\n"):
+            if f":{cfg['port']}" in line and "LISTENING" in line:
+                parts = line.strip().split()
+                if len(parts) >= 5:
+                    pid = int(parts[-1])
+                    _sp.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5)
+                    killed = True
+        
+        import asyncio
+        await asyncio.sleep(2)
+        
+        if not _is_port_listening(cfg["port"]):
+            return {"success": True, "message": f"{cfg['name']}已停止"}
+        else:
+            return {"success": False, "message": f"{cfg['name']}停止失败"}
+    except Exception as e:
+        return {"success": False, "message": f"停止失败: {str(e)}"}
+
+
+@app.post("/api/v1/system/services/{service_key}/restart")
+async def restart_service_api(service_key: str):
+    """重启指定服务"""
+    await stop_service_api(service_key)
+    import asyncio
+    await asyncio.sleep(2)
+    return await start_service_api(service_key)

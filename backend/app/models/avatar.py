@@ -24,6 +24,8 @@ class Avatar(Base):
     
     # 原始照片路径
     original_image_path = Column(String(500))
+    # 去背景透明PNG路径（人物only，背景透明）
+    transparent_image_path = Column(String(500), nullable=True)
     # 风格化后照片路径
     styled_image_path = Column(String(500), nullable=True)
     
